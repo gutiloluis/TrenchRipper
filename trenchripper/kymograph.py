@@ -161,7 +161,7 @@ class kymograph_cluster:
                  invert=False,y_percentile=85,y_foreground_percentile=80,y_min_edge_dist=50,midpoint_dist_tolerence=50,smoothing_kernel_y=(1,9),y_percentile_threshold=0.2,\
                  top_orientation=0,expected_num_rows=None,alternate_orientation=True,alternate_over_rows=False,consensus_orientations=None,\
                  consensus_midpoints=None,x_percentile=85,background_kernel_x=(1,21),smoothing_kernel_x=(1,9),otsu_scaling=1.,min_threshold=0,trench_present_thr=0.,\
-                o2_file_rename_latency=10.):
+                x_drift_method="midpoints",o2_file_rename_latency=10.):
 
         if paramfile:
             parampath = headpath + "/kymograph.par"
@@ -194,6 +194,7 @@ class kymograph_cluster:
             otsu_scaling = param_dict["Otsu Threshold Scaling"]
             min_threshold= param_dict['Minimum X Threshold']
             trench_present_thr =  param_dict["Trench Presence Threshold"]
+            x_drift_method = param_dict.get("X Drift Method","midpoints") # or "registration"
 
         self.headpath = headpath
         self.kymographpath = self.headpath + "/kymograph"
@@ -243,6 +244,7 @@ class kymograph_cluster:
         self.min_threshold = min_threshold
         ## New
         self.trench_present_thr = trench_present_thr
+        self.x_drift_method = x_drift_method
 
         self.output_chunk_shape = (1,1,self.ttl_len_y,(self.trench_width_x//2)*2)
         self.output_chunk_bytes = (2*np.multiply.accumulate(np.array(self.output_chunk_shape))[-1])
@@ -258,7 +260,7 @@ class kymograph_cluster:
                                  "top_orientation":top_orientation,"expected_num_rows":expected_num_rows,"alternate_orientation":alternate_orientation,\
                                  "alternate_over_rows":alternate_over_rows,"consensus_orientations":consensus_orientations,"consensus_midpoints":consensus_midpoints,\
                                  "x_percentile":x_percentile,"background_kernel_x":background_kernel_x,"smoothing_kernel_x":smoothing_kernel_x,\
-                                "otsu_scaling":otsu_scaling,"min_x_threshold":min_threshold,"trench_present_thr":trench_present_thr}
+                                "otsu_scaling":otsu_scaling,"min_x_threshold":min_threshold,"trench_present_thr":trench_present_thr,"x_drift_method":x_drift_method}
 
 
     def median_filter_2d(self,array,smoothing_kernel,edge_width=3):
@@ -841,6 +843,31 @@ class kymograph_cluster:
             x_drift_list.append(net_x_drift)
         return x_drift_list
 
+    def get_x_drift_registered(self,x_percentile_futures,upsample=100,taper=0.1):
+        """Alternative to get_x_drift, chosen by "X Drift Method": "registration" in kymograph.par.
+
+        ONE x drift per frame for the whole FOV, applied to every row: each row's x percentile
+        profile is registered against frame 0 (sub-pixel and never frame to frame, so no
+        whole-pixel steps add up), and the rows' median, rounded once, is the FOV's drift.
+
+        Args:
+            x_percentile_futures (list): get_smoothed_x_percentiles of the FOV's files, in time order.
+            upsample (int): registration precision, 1/upsample px.
+            taper (float): share of each profile tapered to 0 at its ends (the frame's edges stay put).
+
+        Returns:
+            list: One array per row, all the same: the net x drift (int) at every timepoint.
+        """
+        profiles = np.concatenate(x_percentile_futures,axis=1) # row x t x x
+        window = scipy.signal.windows.tukey(profiles.shape[2],taper)
+        row_drifts = []
+        for row_profiles in profiles:
+            row_profiles = (row_profiles-row_profiles.mean(axis=1,keepdims=True))*window
+            row_drifts.append([-sk.registration.phase_cross_correlation(row_profiles[0],profile,\
+                upsample_factor=upsample,normalization=None)[0][0] for profile in row_profiles])
+        x_drift = np.round(np.median(np.array(row_drifts),axis=0)).astype(int)
+        return [x_drift.copy() for _ in range(profiles.shape[0])]
+
     def get_median_x_drift(self,x_drift_futures):
         uppacked_x_drift_futures = [row for fov in x_drift_futures for row in fov]
         median_drift = np.round(np.median(np.array(uppacked_x_drift_futures),axis=0)).astype(int)
@@ -1235,8 +1262,12 @@ class kymograph_cluster:
         for k,fov_idx in enumerate(fov_list):
             working_fovdf = fovdf.loc[fov_idx]
             working_files = working_fovdf["File Index"].unique().tolist()
-            midpoint_futures = [dask_controller.futures["X Midpoints: " + str(file_idx)] for file_idx in working_files]
-            future = dask_controller.daskclient.submit(self.get_x_drift,midpoint_futures,retries=1)
+            if self.x_drift_method == "registration":
+                x_percentile_futures = [dask_controller.futures["Smoothed X Percentiles: " + str(file_idx)] for file_idx in working_files]
+                future = dask_controller.daskclient.submit(self.get_x_drift_registered,x_percentile_futures,retries=1)
+            else:
+                midpoint_futures = [dask_controller.futures["X Midpoints: " + str(file_idx)] for file_idx in working_files]
+                future = dask_controller.daskclient.submit(self.get_x_drift,midpoint_futures,retries=1)
             dask_controller.futures["X Drift: " + str(fov_idx)] = future
 
         ### optionally get median drift ###
